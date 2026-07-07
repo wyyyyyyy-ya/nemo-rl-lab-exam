@@ -28,6 +28,25 @@ class QAAgentMetadata(TypedDict, total=False):
     query: str
     expected_answer: str
     search_count: int
+    last_search_query: str
+
+
+def _suggest_search_from_query(query: str) -> str:
+    """从题面抽取更具体的检索建议。"""
+    m = re.search(r"题目[：:](.*?)(?:\n\n选项|\n选项：|\n选项:|\Z)", query, re.DOTALL)
+    if m:
+        topic = re.sub(r"\s+", " ", m.group(1).strip())
+        return topic[:80] if topic else query.strip()[:80]
+    return query.strip()[:80]
+
+
+def _normalize_search_query(q: str) -> str:
+    return re.sub(r"\s+", " ", q.strip().lower())
+
+
+def _is_short_search(query: str, min_len: int) -> bool:
+    compact = re.sub(r"\s+", "", query)
+    return len(compact) < min_len
 
 
 def _last_assistant_text(message_log: LLMMessageLogType) -> str:
@@ -117,12 +136,20 @@ def search_markdown_docs(
     return [(rel, snippet) for _, rel, snippet, _ in hits[:top_k]]
 
 
-def format_search_results(keyword: str, results: list[tuple[str, str]]) -> str:
+def format_search_results(
+    keyword: str,
+    results: list[tuple[str, str]],
+    *,
+    suggest: str = "",
+) -> str:
     if not results:
-        return (
-            f"[检索结果]\n"
-            f"未找到与「{keyword}」相关的资料，请换关键词或直接给出 \\boxed{{答案}}。"
-        )
+        lines = [
+            "[检索结果]",
+            f"未找到与「{keyword}」相关的资料，请换更具体的关键词后再检索，或直接给出 \\boxed{{答案}}。",
+        ]
+        if suggest and _normalize_search_query(suggest) != _normalize_search_query(keyword):
+            lines.append(f"建议尝试：<search>{suggest}</search>")
+        return "\n".join(lines)
     lines = ["[检索结果]"]
     for i, (path, snippet) in enumerate(results, start=1):
         lines.append(f"{i}. {path}\n{snippet}")
@@ -147,6 +174,10 @@ def _self_test() -> None:
         assert "control.md" in formatted
         print("format OK")
         assert extract_boxed("应选 A \\boxed{A}") == "A"
+        q = "下面是一道单选题。\n\n题目：Carrier FOUP FOSB 创建\n\n选项：\nA. x"
+        assert "Carrier" in _suggest_search_from_query(q)
+        assert _is_short_search("ILD", 4)
+        assert not _is_short_search("Carrier FOUP", 4)
         print("qa_agent_env self-test OK")
 
 
@@ -170,11 +201,18 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
     def __init__(self, cfg: Optional[dict[str, Any]] = None):
         self.cfg = cfg or {}
         self.docs_dir = str(self.cfg.get("docs_dir", "/data/docs"))
-        self.max_searches = int(self.cfg.get("max_searches", 5))
+        self.max_searches = int(self.cfg.get("max_searches", 3))
         self.search_top_k = int(self.cfg.get("search_top_k", 3))
         self.snippet_chars = int(self.cfg.get("snippet_chars", 400))
-        self.invalid_action_penalty = float(self.cfg.get("invalid_action_penalty", -0.05))
+        self.min_search_len = int(self.cfg.get("min_search_len", 4))
+        self.invalid_action_penalty = float(self.cfg.get("invalid_action_penalty", -0.1))
         self.truncation_penalty = float(self.cfg.get("truncation_penalty", 0.0))
+        self.no_search_before_answer_penalty = float(
+            self.cfg.get("no_search_before_answer_penalty", -0.1)
+        )
+        self.require_search_before_answer = bool(
+            self.cfg.get("require_search_before_answer", True)
+        )
         self.use_judge = bool(self.cfg.get("use_judge", True))
 
         if self.use_judge:
@@ -204,9 +242,24 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
         query = str(meta.get("query", ""))
         expected = str(meta.get("expected_answer", ""))
         search_count = int(meta.get("search_count", 0))
+        last_search = str(meta.get("last_search_query", ""))
         last_text = _last_assistant_text(message_log)
+        suggest = _suggest_search_from_query(query)
 
-        if extract_boxed(_all_assistant_text(message_log)) is not None:
+        boxed = extract_boxed(_all_assistant_text(message_log))
+        if boxed is not None:
+            if self.require_search_before_answer and search_count == 0:
+                content = (
+                    "请先至少检索一次资料：<search>关键词</search>，"
+                    "阅读 [检索结果] 后再给出 \\boxed{答案}。"
+                    f"建议：<search>{suggest}</search>"
+                )
+                return (
+                    {"role": "environment", "content": content},
+                    meta,
+                    self.no_search_before_answer_penalty,
+                    False,
+                )
             reward = self._score_final(message_log, query, expected)
             obs = {"role": "environment", "content": f"得分: {reward:.3f}"}
             return obs, None, reward, True
@@ -216,14 +269,43 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
             if search_count >= self.max_searches:
                 content = (
                     f"[检索结果]\n"
-                    f"已达最大检索次数（{self.max_searches}），"
-                    f"请根据已有信息给出 \\boxed{{答案}}。"
+                    f"已达最大检索次数（{self.max_searches}），不得继续 search。"
+                    f"请根据已有信息直接输出 \\boxed{{答案}}。"
                 )
-                new_meta: QAAgentMetadata = {
-                    **meta,
-                    "search_count": search_count,
-                }
-                return {"role": "environment", "content": content}, new_meta, 0.0, False
+                return (
+                    {"role": "environment", "content": content},
+                    None,
+                    self.truncation_penalty,
+                    True,
+                )
+
+            if last_search and _normalize_search_query(search_query) == _normalize_search_query(
+                last_search
+            ):
+                content = (
+                    f"[检索结果]\n"
+                    f"您已搜过「{search_query}」，请换更具体的关键词，或直接 \\boxed{{答案}}。"
+                    f"建议：<search>{suggest}</search>"
+                )
+                return (
+                    {"role": "environment", "content": content},
+                    meta,
+                    self.invalid_action_penalty,
+                    False,
+                )
+
+            if _is_short_search(search_query, self.min_search_len):
+                content = (
+                    f"[检索结果]\n"
+                    f"检索词「{search_query}」过短，请用更完整的专业名词或题干关键词。"
+                    f"建议：<search>{suggest}</search>"
+                )
+                return (
+                    {"role": "environment", "content": content},
+                    meta,
+                    self.invalid_action_penalty,
+                    False,
+                )
 
             results = search_markdown_docs(
                 self.docs_dir,
@@ -231,14 +313,21 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
                 top_k=self.search_top_k,
                 snippet_chars=self.snippet_chars,
             )
-            content = format_search_results(search_query, results)
-            new_meta = {**meta, "search_count": search_count + 1}
+            content = format_search_results(search_query, results, suggest=suggest)
+            new_meta: QAAgentMetadata = {
+                **meta,
+                "search_count": search_count + 1,
+                "last_search_query": search_query,
+            }
             return {"role": "environment", "content": content}, new_meta, 0.0, False
 
-        content = (
-            "请使用 <search>关键词</search> 检索资料，"
-            "或把最终答案写入 \\boxed{...}。"
-        )
+        if search_count > 0:
+            content = "请根据已有 [检索结果] 分析，并输出最终 \\boxed{答案}。"
+        else:
+            content = (
+                "请先用 <search>关键词</search> 检索资料。"
+                f"建议：<search>{suggest}</search>"
+            )
         return (
             {"role": "environment", "content": content},
             meta,
@@ -260,6 +349,7 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
         for log, meta in zip(message_log_batch, metadata, strict=False):
             meta = dict(meta or {})
             meta.setdefault("search_count", 0)
+            meta.setdefault("last_search_query", "")
             obs, new_meta, reward, terminated = self._step_one(log, meta)
             observations.append(obs)
             next_metadata.append(new_meta)

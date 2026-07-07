@@ -38,8 +38,12 @@ TASK_NAME = "qa_agent"
 STOP_STRINGS = ["</search>"]
 
 DEFAULT_AGENT_SYSTEM_PROMPT = (
-    "你是技术培训考题助手。作答前可使用 <search>关键词</search> 检索技术资料（可多次），"
-    "检索完成后给出分析，并把最终答案写入 \\boxed{...}。"
+    "你是技术培训考题助手。必须严格按以下流程作答：\n"
+    "1. 先用 <search>题干关键词</search> 检索技术资料（至少 1 次，最多 3 次）；\n"
+    "2. 阅读 [检索结果] 后简要分析；\n"
+    "3. 最后只输出一次 \\boxed{答案}。\n"
+    "禁止：不检索就直接 \\boxed{}；禁止重复相同 search；禁止只有 search 没有最终 \\boxed{}。\n"
+    "检索词请用题目里的专业名词或中英文术语，不要只搜 2~3 个字母的缩写。"
 )
 
 
@@ -107,6 +111,7 @@ class QAAgentJsonlDataset(Dataset):
                 "expected_answer": expected,
                 "query": query,
                 "search_count": 0,
+                "last_search_query": "",
             },
             "loss_multiplier": 1.0,
             "idx": idx,

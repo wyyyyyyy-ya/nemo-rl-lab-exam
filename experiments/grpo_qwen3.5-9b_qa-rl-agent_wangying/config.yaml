@@ -13,17 +13,17 @@ policy:
   model_name: "Qwen/Qwen3.5-9B-Base"
   tokenizer:
     name: "Qwen/Qwen3.5-9B-Base"
-  max_total_sequence_length: 3072 # 多轮：题目 + 检索回灌 + 作答；OOM 再降
-  train_global_batch_size: 32 # = num_prompts_per_step × num_generations_per_prompt（4×8）
+  max_total_sequence_length: 3072
+  train_global_batch_size: 32
   generation:
-    max_new_tokens: 512 # 每轮生成长度；检索轮宜短，作答轮需足够写到 \boxed{}
+    max_new_tokens: 512
     vllm_cfg:
-      gpu_memory_utilization: 0.4 # 多轮 seq 更长，略降 vLLM 占比防 OOM
+      gpu_memory_utilization: 0.4
 
 grpo:
   num_prompts_per_step: 4
   num_generations_per_prompt: 8
-  max_rollout_turns: 8 # 检索 + 作答总轮数上限
+  max_rollout_turns: 6
   max_num_steps: 400
   val_period: 50
   val_at_start: true
@@ -39,7 +39,7 @@ data:
   shuffle: true
   input_key: query
   output_key: expected_answer
-  system_prompt: null # null 时 run.py 使用默认 Agent 系统提示
+  system_prompt: null
   data_dir: /data/datasets/qa_rl
 
 env:
@@ -47,11 +47,15 @@ env:
   qa_agent:
     cfg:
       docs_dir: /data/docs
-      max_searches: 5
+      max_searches: 3
       search_top_k: 3
       snippet_chars: 400
+      min_search_len: 4
+      require_search_before_answer: true
+      no_search_before_answer_penalty: -0.1
       use_judge: true
-      invalid_action_penalty: -0.05
+      invalid_action_penalty: -0.1
+      truncation_penalty: 0.0
 
 logger:
   wandb_enabled: false

@@ -1,0 +1,61 @@
+# 多轮 QA Agent GRPO：Qwen3.5-9B 在技术培训考题上强化训练（可检索 /data/docs）。
+# 继承多轮 Agent 基底 + qwen3.5-9b + Megatron + LoRA；入口为本目录 run.py + QAAgentEnv。
+#
+# 与 grpo_qwen3.5-9b_qa-rl_v1（单轮 baseline）对比：本实验允许多轮 <search> 检索后再 \boxed{} 作答。
+defaults:
+  - ../../configs/base/grpo_sliding_puzzle.yaml
+  - ../../configs/models/qwen3.5-9b.yaml
+  - ../../configs/base/grpo_megatron.yaml
+  - ../../configs/base/grpo_lora.yaml
+
+# ───────────────────────────── ① 调参区（按需改）─────────────────────────────
+policy:
+  model_name: "Qwen/Qwen3.5-9B-Base"
+  tokenizer:
+    name: "Qwen/Qwen3.5-9B-Base"
+  max_total_sequence_length: 3072 # 多轮：题目 + 检索回灌 + 作答；OOM 再降
+  train_global_batch_size: 32 # = num_prompts_per_step × num_generations_per_prompt（4×8）
+  generation:
+    max_new_tokens: 512 # 每轮生成长度；检索轮宜短，作答轮需足够写到 \boxed{}
+    vllm_cfg:
+      gpu_memory_utilization: 0.4 # 多轮 seq 更长，略降 vLLM 占比防 OOM
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+  max_rollout_turns: 8 # 检索 + 作答总轮数上限
+  max_num_steps: 400
+  val_period: 50
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 64
+  val_batch_size: 64
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+
+# ────────────────────────── ② 数据 / 环境 / 日志 ──────────────────────────
+data:
+  shuffle: true
+  input_key: query
+  output_key: expected_answer
+  system_prompt: null # null 时 run.py 使用默认 Agent 系统提示
+  data_dir: /data/datasets/qa_rl
+
+env:
+  _override_: true
+  qa_agent:
+    cfg:
+      docs_dir: /data/docs
+      max_searches: 5
+      search_top_k: 3
+      snippet_chars: 400
+      use_judge: true
+      invalid_action_penalty: -0.05
+
+logger:
+  wandb_enabled: false
+  tensorboard_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  num_val_samples_to_print: 3

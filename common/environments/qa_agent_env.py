@@ -29,15 +29,59 @@ class QAAgentMetadata(TypedDict, total=False):
     expected_answer: str
     search_count: int
     last_search_query: str
+    has_search_hit: bool
+
+
+_FILL_BLANK_PLACEHOLDER = re.compile(r"【\d+】")
+_SUGGEST_SKIP_TOKENS = frozenset(
+    {"根据", "下面", "一道", "填空题", "选择题", "单选题", "多选题", "两种", "三种", "四种", "题目"}
+)
+_PLACEHOLDER_SEARCH_NORMALIZED = frozenset(
+    {
+        "题干关键词",
+        "关键词",
+        "专业名词",
+        "从题目提取的专业名词",
+        "题目原文或专业名词",
+        "题干",
+        "search",
+        "检索",
+    }
+)
+
+
+def _compact_search_suggest(text: str, max_len: int = 30) -> str:
+    """把题面压成适合 grep 的短检索词（去填空占位符、去套话）。"""
+    text = _FILL_BLANK_PLACEHOLDER.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_len:
+        return text
+    tokens = re.findall(r"[A-Za-z]{2,}|[\u4e00-\u9fff]{2,}", text)
+    buf = ""
+    for t in tokens:
+        if t in _SUGGEST_SKIP_TOKENS:
+            continue
+        candidate = f"{buf} {t}".strip() if buf else t
+        if len(candidate) > max_len:
+            break
+        buf = candidate
+    return buf or text[:max_len]
 
 
 def _suggest_search_from_query(query: str) -> str:
     """从题面抽取更具体的检索建议。"""
     m = re.search(r"题目[：:](.*?)(?:\n\n选项|\n选项：|\n选项:|\Z)", query, re.DOTALL)
     if m:
-        topic = re.sub(r"\s+", " ", m.group(1).strip())
-        return topic[:80] if topic else query.strip()[:80]
-    return query.strip()[:80]
+        return _compact_search_suggest(m.group(1).strip())
+    m2 = re.search(r"题目[：:](.+)", query)
+    if m2:
+        return _compact_search_suggest(m2.group(1).strip())
+    return _compact_search_suggest(query.strip())
+
+
+def _is_placeholder_search(query: str) -> bool:
+    """检测模型是否把 prompt 占位符原样当作 search 内容。"""
+    return _normalize_search_query(query) in _PLACEHOLDER_SEARCH_NORMALIZED
 
 
 def _normalize_search_query(q: str) -> str:
@@ -330,6 +374,12 @@ def _self_test() -> None:
             fallback_query="Exclude Sample",
         )
         assert fb_results and fb_q == "Exclude Sample"
+        q_mrb = "下面是一道填空题。\n\n题目：根据受影响wafer数量，MRB有【1】【2】两种分类"
+        mrb_suggest = _suggest_search_from_query(q_mrb)
+        assert "【" not in mrb_suggest
+        assert "MRB" in mrb_suggest or "wafer" in mrb_suggest
+        assert _is_placeholder_search("题干关键词")
+        assert not _is_placeholder_search("MRB wafer 数量")
         print("qa_agent_env self-test OK")
 
 
@@ -368,6 +418,9 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
         self.auto_fallback_search = bool(self.cfg.get("auto_fallback_search", True))
         self.split_long_search = bool(self.cfg.get("split_long_search", True))
         self.split_max_len = int(self.cfg.get("split_max_len", 30))
+        self.require_search_hit_before_answer = bool(
+            self.cfg.get("require_search_hit_before_answer", True)
+        )
         self.use_judge = bool(self.cfg.get("use_judge", True))
 
         if self.use_judge:
@@ -398,6 +451,7 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
         expected = str(meta.get("expected_answer", ""))
         search_count = int(meta.get("search_count", 0))
         last_search = str(meta.get("last_search_query", ""))
+        has_search_hit = bool(meta.get("has_search_hit", False))
         last_text = _last_assistant_text(message_log)
         suggest = _suggest_search_from_query(query)
 
@@ -405,14 +459,31 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
         if boxed is not None:
             if self.require_search_before_answer and search_count == 0:
                 content = (
-                    "请先至少检索一次资料：<search>关键词</search>，"
+                    "请先至少检索一次资料，例如 "
+                    f"<search>{suggest}</search>，"
                     "阅读 [检索结果] 后再给出 \\boxed{答案}。"
-                    f"建议：<search>{suggest}</search>"
+                    "不要把「题干关键词」等说明文字原样当作 search 内容。"
                 )
                 return (
                     {"role": "environment", "content": content},
                     meta,
                     self.no_search_before_answer_penalty,
+                    False,
+                )
+            if (
+                self.require_search_hit_before_answer
+                and search_count > 0
+                and not has_search_hit
+                and search_count < self.max_searches
+            ):
+                content = (
+                    "此前检索均未命中有效资料，不得凭常识或编造 [检索结果] 作答。"
+                    f"请换更短、更贴题的关键词再 search，例如 <search>{suggest}</search>。"
+                )
+                return (
+                    {"role": "environment", "content": content},
+                    meta,
+                    self.invalid_action_penalty,
                     False,
                 )
             reward = self._score_final(message_log, query, expected)
@@ -462,6 +533,19 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
                     False,
                 )
 
+            if _is_placeholder_search(search_query):
+                content = (
+                    f"[检索结果]\n"
+                    f"检索词「{search_query}」是说明文字而非真实关键词，请从题目提取专业名词。"
+                    f"例如：<search>{suggest}</search>"
+                )
+                return (
+                    {"role": "environment", "content": content},
+                    meta,
+                    self.invalid_action_penalty,
+                    False,
+                )
+
             biased_opt = _search_biased_by_options(search_query, query)
             if biased_opt:
                 content = (
@@ -497,6 +581,7 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
                 **meta,
                 "search_count": search_count + 1,
                 "last_search_query": search_query,
+                "has_search_hit": has_search_hit or bool(results),
             }
             return {"role": "environment", "content": content}, new_meta, 0.0, False
 
@@ -504,8 +589,9 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
             content = "请根据已有 [检索结果] 分析，并输出最终 \\boxed{答案}。"
         else:
             content = (
-                "请先用 <search>关键词</search> 检索资料。"
-                f"建议：<search>{suggest}</search>"
+                "请先从题目提取专业名词检索，例如 "
+                f"<search>{suggest}</search>。"
+                "不要把「题干关键词」等说明文字原样当作 search 内容。"
             )
         return (
             {"role": "environment", "content": content},
@@ -529,6 +615,7 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
             meta = dict(meta or {})
             meta.setdefault("search_count", 0)
             meta.setdefault("last_search_query", "")
+            meta.setdefault("has_search_hit", False)
             obs, new_meta, reward, terminated = self._step_one(log, meta)
             observations.append(obs)
             next_metadata.append(new_meta)

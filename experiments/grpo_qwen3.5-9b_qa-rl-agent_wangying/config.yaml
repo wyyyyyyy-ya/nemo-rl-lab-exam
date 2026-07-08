@@ -55,6 +55,7 @@ env:
       auto_fallback_search: true
       split_long_search: true
       split_max_len: 30
+      require_search_hit_before_answer: true
       no_search_before_answer_penalty: -0.1
       use_judge: true
       invalid_action_penalty: -0.1

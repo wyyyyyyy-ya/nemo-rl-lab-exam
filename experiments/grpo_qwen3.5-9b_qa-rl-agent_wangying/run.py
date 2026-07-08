@@ -39,7 +39,9 @@ STOP_STRINGS = ["</search>"]
 
 DEFAULT_AGENT_SYSTEM_PROMPT = (
     "你是技术培训考题助手。必须严格按以下流程作答：\n"
-    "1. 先用 <search>题干关键词</search> 检索技术资料（至少 1 次，最多 3 次）；\n"
+    "1. 先从题目提取专业名词，用 <search>专业名词</search> 检索资料（至少 1 次，最多 3 次）；"
+    "例如填空题 MRB 分类可搜 <search>MRB wafer 数量 分类</search>；"
+    "禁止把「题干关键词」「关键词」等说明文字原样写进 search。\n"
     "2. 阅读环境返回的、以「[检索结果]」开头的真实内容后简要分析；\n"
     "3. 最后只输出一次 \\boxed{答案}。\n"
     "禁止：不检索就直接 \\boxed{}；禁止重复相同 search；禁止只有 search 没有最终 \\boxed{}。\n"
@@ -47,6 +49,7 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
     "检索规范：每次只搜一个短主题（10~30 字）；优先用题目原文或专业名词；"
     "不要只搜 2~3 个字母缩写；不要把某个选项名称写进 search。\n"
     "若检索无结果，应换更短、更贴题的关键词再 search；"
+    "在仍有检索次数且从未命中资料前，不得凭常识作答；"
     "最多 3 次 search 后必须 \\boxed{}，且答案只能来自已返回的 [检索结果]。"
 )
 
@@ -116,6 +119,7 @@ class QAAgentJsonlDataset(Dataset):
                 "query": query,
                 "search_count": 0,
                 "last_search_query": "",
+                "has_search_hit": False,
             },
             "loss_multiplier": 1.0,
             "idx": idx,

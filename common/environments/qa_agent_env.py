@@ -84,6 +84,85 @@ def _snippet_around(text: str, pos: int, radius: int) -> str:
     return snippet
 
 
+def _extract_option_terms(query: str) -> list[str]:
+    """从题面选项行提取文本，用于检测 search 是否带入选项名称。"""
+    terms: list[str] = []
+    for m in re.finditer(r"^[A-L][\.、．\)]\s*(.+)$", query, re.MULTILINE):
+        text = re.sub(r"\s+", " ", m.group(1).strip())
+        if len(text) >= 4:
+            terms.append(text)
+    return terms
+
+
+def _search_biased_by_options(search_query: str, query: str) -> str | None:
+    sq = _normalize_search_query(search_query)
+    for opt in _extract_option_terms(query):
+        if _normalize_search_query(opt) in sq:
+            return opt
+    return None
+
+
+def _split_search_queries(keyword: str, max_len: int = 30) -> list[str]:
+    """长检索词拆成多个短 query。"""
+    keyword = keyword.strip()
+    if len(keyword) <= max_len:
+        return [keyword]
+    chunks = [c for c in re.split(r"[\s,，、；;]+", keyword) if c.strip()]
+    parts: list[str] = []
+    buf = ""
+    for c in chunks:
+        if len(buf) + len(c) + 1 <= max_len:
+            buf = f"{buf} {c}".strip() if buf else c
+        else:
+            if buf:
+                parts.append(buf)
+            buf = c
+    if buf:
+        parts.append(buf)
+    for c in chunks:
+        if len(c) >= 4 and c not in parts:
+            parts.append(c)
+    return parts[:3] or [keyword[:max_len]]
+
+
+_LOW_QUALITY_SNIPPET = (
+    re.compile(r"\[End OCR\]", re.I),
+    re.compile(r"## Page \d+", re.I),
+    re.compile(r"Slide number:", re.I),
+    re.compile(r"^\s*目录\s", re.I),
+)
+
+
+def _is_low_quality_snippet(snippet: str) -> bool:
+    s = snippet.strip()
+    if len(s) < 24:
+        return True
+    for pat in _LOW_QUALITY_SNIPPET:
+        if pat.search(s):
+            return True
+    if s.count("…") > 4:
+        return True
+    return False
+
+
+def _merge_search_results(
+    *groups: list[tuple[str, str]],
+    top_k: int,
+) -> list[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    merged: list[tuple[str, str]] = []
+    for group in groups:
+        for rel, snippet in group:
+            key = (rel, snippet[:100])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((rel, snippet))
+            if len(merged) >= top_k:
+                return merged
+    return merged
+
+
 def _keyword_terms(keyword: str) -> list[str]:
     terms = [t for t in re.split(r"[\s,，、/]+", keyword.strip()) if t]
     return terms or [keyword.strip()]
@@ -101,8 +180,9 @@ def search_markdown_docs(
     top_k: int = 3,
     snippet_chars: int = 400,
     max_files: int = 500,
+    filter_low_quality: bool = True,
 ) -> list[tuple[str, str]]:
-    """在 docs_dir 下检索 markdown，返回 [(相对路径, 片段), ...]。"""
+    """在 docs_dir 下检索 markdown/txt，返回 [(相对路径, 片段), ...]。"""
     root = Path(docs_dir)
     if not root.is_dir():
         return []
@@ -111,29 +191,82 @@ def search_markdown_docs(
     hits: list[tuple[int, str, str, int]] = []
 
     scanned = 0
-    for path in root.rglob("*.md"):
+    for pattern in ("*.md", "*.txt"):
+        for path in root.rglob(pattern):
+            if scanned >= max_files:
+                break
+            scanned += 1
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            score = _score_text(text, terms)
+            if score <= 0:
+                continue
+            rel = str(path.relative_to(root))
+            pos = 0
+            lower = text.lower()
+            for term in terms:
+                idx = lower.find(term.lower())
+                if idx >= 0:
+                    pos = idx
+                    break
+            snippet = _snippet_around(text, pos, snippet_chars)
+            if filter_low_quality and _is_low_quality_snippet(snippet):
+                continue
+            hits.append((score, rel, snippet, pos))
         if scanned >= max_files:
             break
-        scanned += 1
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        score = _score_text(text, terms)
-        if score <= 0:
-            continue
-        rel = str(path.relative_to(root))
-        pos = 0
-        lower = text.lower()
-        for term in terms:
-            idx = lower.find(term.lower())
-            if idx >= 0:
-                pos = idx
-                break
-        hits.append((score, rel, _snippet_around(text, pos, snippet_chars), pos))
 
     hits.sort(key=lambda x: (-x[0], x[1], x[3]))
     return [(rel, snippet) for _, rel, snippet, _ in hits[:top_k]]
+
+
+def _run_doc_search(
+    docs_dir: str,
+    keyword: str,
+    *,
+    top_k: int,
+    snippet_chars: int,
+    split_long_search: bool,
+    split_max_len: int,
+    auto_fallback: bool,
+    fallback_query: str,
+) -> tuple[list[tuple[str, str]], str]:
+    """执行检索：可选拆词、0 命中时题干将 fallback。返回 (results, effective_query)。"""
+    queries = (
+        _split_search_queries(keyword, max_len=split_max_len)
+        if split_long_search and len(keyword.strip()) > split_max_len
+        else [keyword]
+    )
+    merged: list[tuple[str, str]] = []
+    for q in queries:
+        merged = _merge_search_results(
+            merged,
+            search_markdown_docs(
+                docs_dir,
+                q,
+                top_k=top_k,
+                snippet_chars=snippet_chars,
+            ),
+            top_k=top_k,
+        )
+        if len(merged) >= top_k:
+            break
+
+    effective = keyword
+    if not merged and auto_fallback:
+        fb = fallback_query.strip()
+        if fb and _normalize_search_query(fb) != _normalize_search_query(keyword):
+            merged = search_markdown_docs(
+                docs_dir,
+                fb,
+                top_k=top_k,
+                snippet_chars=snippet_chars,
+            )
+            if merged:
+                effective = fb
+    return merged, effective
 
 
 def format_search_results(
@@ -141,6 +274,7 @@ def format_search_results(
     results: list[tuple[str, str]],
     *,
     suggest: str = "",
+    used_query: str = "",
 ) -> str:
     if not results:
         lines = [
@@ -151,6 +285,8 @@ def format_search_results(
             lines.append(f"建议尝试：<search>{suggest}</search>")
         return "\n".join(lines)
     lines = ["[检索结果]"]
+    if used_query and _normalize_search_query(used_query) != _normalize_search_query(keyword):
+        lines.append(f"（已自动用题干将关键词「{used_query}」补充检索）")
     for i, (path, snippet) in enumerate(results, start=1):
         lines.append(f"{i}. {path}\n{snippet}")
     return "\n".join(lines)
@@ -178,6 +314,22 @@ def _self_test() -> None:
         assert "Carrier" in _suggest_search_from_query(q)
         assert _is_short_search("ILD", 4)
         assert not _is_short_search("Carrier FOUP", 4)
+        assert _split_search_queries("a b c d e f g h i j k l m n o p q r s t", 10)
+        assert _is_low_quality_snippet("## Page 1\nSlide number: 3")
+        assert not _is_low_quality_snippet("控制图 Exclude 功能可以永久排除 Sample")
+        q_opt = "题目：控制图\n\n选项：\nA. Exclude\nB. Point Disable"
+        assert _search_biased_by_options("Point Disable", q_opt) == "Point Disable"
+        fb_results, fb_q = _run_doc_search(
+            str(doc_root),
+            "不存在的关键词xyz",
+            top_k=2,
+            snippet_chars=200,
+            split_long_search=False,
+            split_max_len=30,
+            auto_fallback=True,
+            fallback_query="Exclude Sample",
+        )
+        assert fb_results and fb_q == "Exclude Sample"
         print("qa_agent_env self-test OK")
 
 
@@ -213,6 +365,9 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
         self.require_search_before_answer = bool(
             self.cfg.get("require_search_before_answer", True)
         )
+        self.auto_fallback_search = bool(self.cfg.get("auto_fallback_search", True))
+        self.split_long_search = bool(self.cfg.get("split_long_search", True))
+        self.split_max_len = int(self.cfg.get("split_max_len", 30))
         self.use_judge = bool(self.cfg.get("use_judge", True))
 
         if self.use_judge:
@@ -307,13 +462,37 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
                     False,
                 )
 
-            results = search_markdown_docs(
+            biased_opt = _search_biased_by_options(search_query, query)
+            if biased_opt:
+                content = (
+                    f"[检索结果]\n"
+                    f"检索词包含选项名称「{biased_opt}」，请改用中性关键词（如题目主题），"
+                    f"不要把选项原文写进 search。"
+                    f"建议：<search>{suggest}</search>"
+                )
+                return (
+                    {"role": "environment", "content": content},
+                    meta,
+                    self.invalid_action_penalty,
+                    False,
+                )
+
+            results, effective_query = _run_doc_search(
                 self.docs_dir,
                 search_query,
                 top_k=self.search_top_k,
                 snippet_chars=self.snippet_chars,
+                split_long_search=self.split_long_search,
+                split_max_len=self.split_max_len,
+                auto_fallback=self.auto_fallback_search,
+                fallback_query=suggest,
             )
-            content = format_search_results(search_query, results, suggest=suggest)
+            content = format_search_results(
+                search_query,
+                results,
+                suggest=suggest,
+                used_query=effective_query,
+            )
             new_meta: QAAgentMetadata = {
                 **meta,
                 "search_count": search_count + 1,

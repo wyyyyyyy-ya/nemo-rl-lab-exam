@@ -70,6 +70,23 @@ fi
 #   OUTPUT_ROOT[/<用户>]/<实验名>/<NRL_RUN_ID>
 # 多人共用平台时设 RUN_USER，同一实验多次提交按 run_id 隔离，互不覆盖。
 OUT_DIR="$(_lab_train_output_dir "${EXP_NAME}" "${EXP_DIR}")"
+# 续训：NeMo-RL 会在 checkpoint_dir 已有 step_* 时自动从最新 step 接着训。
+# 方式 1 — 实验目录下 resume_run_id 文件（一行，填上次 lab submit 返回的 run_id）
+# 方式 2 — 环境变量 RESUME_RUN_ID 或 RESUME_CKPT_ROOT（绝对路径，优先级最高）
+if [[ -n "${RESUME_CKPT_ROOT:-}" ]]; then
+  OUT_DIR="${RESUME_CKPT_ROOT}"
+  echo "[run] resume  : RESUME_CKPT_ROOT=${OUT_DIR}"
+else
+  _resume_id="${RESUME_RUN_ID:-}"
+  if [[ -z "${_resume_id}" && -f "${EXP_DIR}/resume_run_id" ]]; then
+    _resume_id="$(tr -d '[:space:]' < "${EXP_DIR}/resume_run_id")"
+  fi
+  if [[ -n "${_resume_id}" && -n "${OUTPUT_ROOT:-}" ]]; then
+    OUT_DIR="${OUTPUT_ROOT%/}${RUN_USER:+/${RUN_USER}}/${EXP_NAME}/${_resume_id}"
+    echo "[run] resume  : reusing run_id=${_resume_id} → ${OUT_DIR}"
+  fi
+fi
+unset _resume_id
 OVERRIDES+=("checkpointing.checkpoint_dir=${OUT_DIR}")
 OVERRIDES+=("logger.log_dir=${OUT_DIR}/logs")
 

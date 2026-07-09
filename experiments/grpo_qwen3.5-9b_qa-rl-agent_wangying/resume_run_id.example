@@ -1,0 +1,9 @@
+# 续训：把本文件复制为 resume_run_id（无后缀），写入上一次 lab submit 返回的 run_id。
+# 例：abc123def456
+#
+# 然后确保 config.yaml 里 max_num_steps > 已完成步数（如 400→500），再 lab submit。
+# NeMo-RL 会自动从 checkpoint_dir 下最新 step_* 接着训。
+#
+# 续训完成后删除 resume_run_id，避免下次误续训。
+
+your_previous_run_id_here

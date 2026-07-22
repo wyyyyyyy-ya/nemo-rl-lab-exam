@@ -15,6 +15,13 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, TypedDict
 
+from common.doc_search import DocumentSearchIndex, is_low_quality_snippet
+from common.qa_agent_state import (
+    credited_search_hit as _credited_search_hit,
+    fallback_eligible as _fallback_eligible,
+    last_assistant_text as _last_assistant_text,
+    next_action_stop_strings as _next_action_stop_strings,
+)
 from common.rewards.qa_reward import extract_boxed
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -30,6 +37,7 @@ class QAAgentMetadata(TypedDict, total=False):
     search_count: int
     last_search_query: str
     has_search_hit: bool
+    fallback_count: int
 
 
 _FILL_BLANK_PLACEHOLDER = re.compile(r"【\d+】")
@@ -93,13 +101,6 @@ def _is_short_search(query: str, min_len: int) -> bool:
     return len(compact) < min_len
 
 
-def _last_assistant_text(message_log: LLMMessageLogType) -> str:
-    for msg in reversed(message_log):
-        if msg.get("role") == "assistant":
-            return str(msg.get("content", "")).strip()
-    return ""
-
-
 def _all_assistant_text(message_log: LLMMessageLogType) -> str:
     parts = [
         str(msg.get("content", "")).strip()
@@ -115,17 +116,6 @@ def _parse_search_query(text: str) -> str | None:
         return None
     query = m.group(1).strip()
     return query or None
-
-
-def _snippet_around(text: str, pos: int, radius: int) -> str:
-    start = max(0, pos - radius // 2)
-    end = min(len(text), pos + radius // 2)
-    snippet = text[start:end].replace("\n", " ").strip()
-    if start > 0:
-        snippet = "..." + snippet
-    if end < len(text):
-        snippet = snippet + "..."
-    return snippet
 
 
 def _extract_option_terms(query: str) -> list[str]:
@@ -169,24 +159,8 @@ def _split_search_queries(keyword: str, max_len: int = 30) -> list[str]:
     return parts[:3] or [keyword[:max_len]]
 
 
-_LOW_QUALITY_SNIPPET = (
-    re.compile(r"\[End OCR\]", re.I),
-    re.compile(r"## Page \d+", re.I),
-    re.compile(r"Slide number:", re.I),
-    re.compile(r"^\s*目录\s", re.I),
-)
-
-
 def _is_low_quality_snippet(snippet: str) -> bool:
-    s = snippet.strip()
-    if len(s) < 24:
-        return True
-    for pat in _LOW_QUALITY_SNIPPET:
-        if pat.search(s):
-            return True
-    if s.count("…") > 4:
-        return True
-    return False
+    return is_low_quality_snippet(snippet)
 
 
 def _merge_search_results(
@@ -207,16 +181,6 @@ def _merge_search_results(
     return merged
 
 
-def _keyword_terms(keyword: str) -> list[str]:
-    terms = [t for t in re.split(r"[\s,，、/]+", keyword.strip()) if t]
-    return terms or [keyword.strip()]
-
-
-def _score_text(text: str, terms: list[str]) -> int:
-    lower = text.lower()
-    return sum(lower.count(term.lower()) for term in terms)
-
-
 def search_markdown_docs(
     docs_dir: str,
     keyword: str,
@@ -224,60 +188,24 @@ def search_markdown_docs(
     top_k: int = 3,
     snippet_chars: int = 400,
     max_files: int = 500,
-    filter_low_quality: bool = True,
 ) -> list[tuple[str, str]]:
-    """在 docs_dir 下检索 markdown/txt，返回 [(相对路径, 片段), ...]。"""
-    root = Path(docs_dir)
-    if not root.is_dir():
-        return []
-
-    terms = _keyword_terms(keyword)
-    hits: list[tuple[int, str, str, int]] = []
-
-    scanned = 0
-    for pattern in ("*.md", "*.txt"):
-        for path in root.rglob(pattern):
-            if scanned >= max_files:
-                break
-            scanned += 1
-            try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            score = _score_text(text, terms)
-            if score <= 0:
-                continue
-            rel = str(path.relative_to(root))
-            pos = 0
-            lower = text.lower()
-            for term in terms:
-                idx = lower.find(term.lower())
-                if idx >= 0:
-                    pos = idx
-                    break
-            snippet = _snippet_around(text, pos, snippet_chars)
-            if filter_low_quality and _is_low_quality_snippet(snippet):
-                continue
-            hits.append((score, rel, snippet, pos))
-        if scanned >= max_files:
-            break
-
-    hits.sort(key=lambda x: (-x[0], x[1], x[3]))
-    return [(rel, snippet) for _, rel, snippet, _ in hits[:top_k]]
+    """兼容旧调用的便捷入口；生产环境使用 Actor 内驻留的 DocumentSearchIndex。"""
+    index = DocumentSearchIndex(docs_dir, max_files=max_files)
+    return index.search(keyword, top_k=top_k, snippet_chars=snippet_chars)
 
 
 def _run_doc_search(
-    docs_dir: str,
+    doc_index: DocumentSearchIndex,
     keyword: str,
     *,
     top_k: int,
     snippet_chars: int,
     split_long_search: bool,
     split_max_len: int,
-    auto_fallback: bool,
+    allow_fallback: bool,
     fallback_query: str,
-) -> tuple[list[tuple[str, str]], str]:
-    """执行检索：可选拆词、0 命中时题干将 fallback。返回 (results, effective_query)。"""
+) -> tuple[list[tuple[str, str]], str, bool]:
+    """执行自主检索；仅当调用方允许且自主检索无结果时额外执行一次 fallback。"""
     queries = (
         _split_search_queries(keyword, max_len=split_max_len)
         if split_long_search and len(keyword.strip()) > split_max_len
@@ -287,50 +215,58 @@ def _run_doc_search(
     for q in queries:
         merged = _merge_search_results(
             merged,
-            search_markdown_docs(
-                docs_dir,
-                q,
-                top_k=top_k,
-                snippet_chars=snippet_chars,
-            ),
+            doc_index.search(q, top_k=top_k, snippet_chars=snippet_chars),
             top_k=top_k,
         )
         if len(merged) >= top_k:
             break
 
     effective = keyword
-    if not merged and auto_fallback:
+    used_fallback = False
+    if not merged and allow_fallback:
         fb = fallback_query.strip()
         if fb and _normalize_search_query(fb) != _normalize_search_query(keyword):
-            merged = search_markdown_docs(
-                docs_dir,
-                fb,
-                top_k=top_k,
-                snippet_chars=snippet_chars,
-            )
-            if merged:
-                effective = fb
-    return merged, effective
+            effective = fb
+            used_fallback = True
+            merged = doc_index.search(fb, top_k=top_k, snippet_chars=snippet_chars)
+    return merged, effective, used_fallback
 
 
 def format_search_results(
     keyword: str,
     results: list[tuple[str, str]],
     *,
-    suggest: str = "",
     used_query: str = "",
+    used_fallback: bool = False,
+    fallback_counts_as_hit: bool = False,
+    searches_remaining: int = 0,
 ) -> str:
     if not results:
         lines = [
             "[检索结果]",
-            f"未找到与「{keyword}」相关的资料，请换更具体的关键词后再检索，或直接给出 \\boxed{{答案}}。",
+            f"未找到与「{keyword}」相关的资料。",
         ]
-        if suggest and _normalize_search_query(suggest) != _normalize_search_query(keyword):
-            lines.append(f"建议尝试：<search>{suggest}</search>")
+        if used_fallback:
+            lines.append(
+                f"三次自主检索均未找到结果，环境已额外使用「{used_query}」兜底检索，仍未命中。"
+            )
+            lines.append("自主检索额度已耗尽，请根据已有信息输出 \\boxed{答案}。")
+        elif searches_remaining > 0:
+            lines.append(
+                f"还可自主检索 {searches_remaining} 次；请自行判断是换词继续 search，还是根据已有信息作答。"
+            )
+        else:
+            lines.append("自主检索额度已耗尽，请根据已有信息输出 \\boxed{答案}。")
         return "\n".join(lines)
     lines = ["[检索结果]"]
-    if used_query and _normalize_search_query(used_query) != _normalize_search_query(keyword):
-        lines.append(f"（已自动用题干将关键词「{used_query}」补充检索）")
+    if used_fallback and used_query:
+        lines.append(
+            f"（三次自主检索均无结果；环境额外使用 fallback 检索词：「{used_query}」）"
+        )
+        if not fallback_counts_as_hit:
+            lines.append(
+                "该结果不计为自主检索命中，且不占三次自主检索额度；请判断片段是否足够并最终作答。"
+            )
     for i, (path, snippet) in enumerate(results, start=1):
         lines.append(f"{i}. {path}\n{snippet}")
     return "\n".join(lines)
@@ -363,23 +299,33 @@ def _self_test() -> None:
         assert not _is_low_quality_snippet("控制图 Exclude 功能可以永久排除 Sample")
         q_opt = "题目：控制图\n\n选项：\nA. Exclude\nB. Point Disable"
         assert _search_biased_by_options("Point Disable", q_opt) == "Point Disable"
-        fb_results, fb_q = _run_doc_search(
-            str(doc_root),
+        index = DocumentSearchIndex(str(doc_root))
+        fb_results, fb_q, used_fallback = _run_doc_search(
+            index,
             "不存在的关键词xyz",
             top_k=2,
             snippet_chars=200,
             split_long_search=False,
             split_max_len=30,
-            auto_fallback=True,
+            allow_fallback=True,
             fallback_query="Exclude Sample",
         )
-        assert fb_results and fb_q == "Exclude Sample"
+        assert fb_results and fb_q == "Exclude Sample" and used_fallback
         q_mrb = "下面是一道填空题。\n\n题目：根据受影响wafer数量，MRB有【1】【2】两种分类"
         mrb_suggest = _suggest_search_from_query(q_mrb)
         assert "【" not in mrb_suggest
         assert "MRB" in mrb_suggest or "wafer" in mrb_suggest
         assert _is_placeholder_search("题干关键词")
         assert not _is_placeholder_search("MRB wafer 数量")
+        # 历史轮次里即使出现过 boxed，当前动作仍必须只由最后一条 assistant 消息决定。
+        history = [
+            {"role": "assistant", "content": r"我先猜 \\boxed{A}"},
+            {"role": "environment", "content": "请先检索"},
+            {"role": "assistant", "content": "<search>控制图永久排除 Sample</search>"},
+        ]
+        current = _last_assistant_text(history)
+        assert extract_boxed(current) is None
+        assert _parse_search_query(current) == "控制图永久排除 Sample"
         print("qa_agent_env self-test OK")
 
 
@@ -406,21 +352,35 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
         self.max_searches = int(self.cfg.get("max_searches", 3))
         self.search_top_k = int(self.cfg.get("search_top_k", 3))
         self.snippet_chars = int(self.cfg.get("snippet_chars", 400))
-        self.min_search_len = int(self.cfg.get("min_search_len", 4))
+        self.doc_index = DocumentSearchIndex(
+            self.docs_dir,
+            max_files=int(self.cfg.get("search_max_files", 5000)),
+            max_chunks=int(self.cfg.get("search_max_chunks", 50000)),
+            chunk_chars=int(self.cfg.get("search_chunk_chars", 800)),
+            overlap_chars=int(self.cfg.get("search_chunk_overlap", 120)),
+            per_file_limit=int(self.cfg.get("search_per_file_limit", 2)),
+            min_query_coverage=float(self.cfg.get("search_min_query_coverage", 0.35)),
+            min_matched_tokens=int(self.cfg.get("search_min_matched_tokens", 2)),
+            min_raw_term_coverage=float(
+                self.cfg.get("search_min_raw_term_coverage", 0.5)
+            ),
+        )
+        print(
+            "[qa_agent] 文档索引: "
+            f"files={self.doc_index.files_indexed} chunks={self.doc_index.chunk_count} "
+            f"truncated={self.doc_index.truncated}"
+        )
         self.invalid_action_penalty = float(self.cfg.get("invalid_action_penalty", -0.1))
-        self.truncation_penalty = float(self.cfg.get("truncation_penalty", 0.0))
-        self.no_search_before_answer_penalty = float(
-            self.cfg.get("no_search_before_answer_penalty", -0.1)
-        )
-        self.require_search_before_answer = bool(
-            self.cfg.get("require_search_before_answer", True)
-        )
         self.auto_fallback_search = bool(self.cfg.get("auto_fallback_search", True))
+        self.fallback_after_failed_searches = int(
+            self.cfg.get("fallback_after_failed_searches", self.max_searches)
+        )
+        self.fallback_penalty = float(self.cfg.get("fallback_penalty", -0.05))
+        self.fallback_counts_as_hit = bool(
+            self.cfg.get("fallback_counts_as_hit", False)
+        )
         self.split_long_search = bool(self.cfg.get("split_long_search", True))
         self.split_max_len = int(self.cfg.get("split_max_len", 30))
-        self.require_search_hit_before_answer = bool(
-            self.cfg.get("require_search_hit_before_answer", True)
-        )
         self.use_judge = bool(self.cfg.get("use_judge", True))
 
         if self.use_judge:
@@ -438,7 +398,8 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
         query: str,
         expected: str,
     ) -> float:
-        completion = _all_assistant_text(message_log)
+        # 只判最后一轮最终回答，避免历史 search、分析或被拒绝的旧答案污染 reward。
+        completion = _last_assistant_text(message_log)
         rewards = self._reward_fn([query], [completion], [expected])
         return float(rewards[0])
 
@@ -455,37 +416,10 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
         last_text = _last_assistant_text(message_log)
         suggest = _suggest_search_from_query(query)
 
-        boxed = extract_boxed(_all_assistant_text(message_log))
+        # 动作解析只看本轮输出。若历史中曾有一个被环境拒绝的 boxed，后续轮次
+        # 仍应能执行 search；最终评分时 _score_final 会从完整轨迹取最后一个 boxed。
+        boxed = extract_boxed(last_text)
         if boxed is not None:
-            if self.require_search_before_answer and search_count == 0:
-                content = (
-                    "请先至少检索一次资料，例如 "
-                    f"<search>{suggest}</search>，"
-                    "阅读 [检索结果] 后再给出 \\boxed{答案}。"
-                    "不要把「题干关键词」等说明文字原样当作 search 内容。"
-                )
-                return (
-                    {"role": "environment", "content": content},
-                    meta,
-                    self.no_search_before_answer_penalty,
-                    False,
-                )
-            if (
-                self.require_search_hit_before_answer
-                and search_count > 0
-                and not has_search_hit
-                and search_count < self.max_searches
-            ):
-                content = (
-                    "此前检索均未命中有效资料，不得凭常识或编造 [检索结果] 作答。"
-                    f"请换更短、更贴题的关键词再 search，例如 <search>{suggest}</search>。"
-                )
-                return (
-                    {"role": "environment", "content": content},
-                    meta,
-                    self.invalid_action_penalty,
-                    False,
-                )
             reward = self._score_final(message_log, query, expected)
             obs = {"role": "environment", "content": f"得分: {reward:.3f}"}
             return obs, None, reward, True
@@ -500,9 +434,9 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
                 )
                 return (
                     {"role": "environment", "content": content},
-                    None,
-                    self.truncation_penalty,
-                    True,
+                    meta,
+                    0.0,  # 暂不惩罚超过最大搜索次数；仍拦截执行并提示最终作答。
+                    False,
                 )
 
             if last_search and _normalize_search_query(search_query) == _normalize_search_query(
@@ -510,8 +444,8 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
             ):
                 content = (
                     f"[检索结果]\n"
-                    f"您已搜过「{search_query}」，请换更具体的关键词，或直接 \\boxed{{答案}}。"
-                    f"建议：<search>{suggest}</search>"
+                    f"您已搜过「{search_query}」。请自行决定换一个不同的检索词，"
+                    "或根据已有结果输出 \\boxed{答案}。"
                 )
                 return (
                     {"role": "environment", "content": content},
@@ -520,73 +454,60 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
                     False,
                 )
 
-            if _is_short_search(search_query, self.min_search_len):
-                content = (
-                    f"[检索结果]\n"
-                    f"检索词「{search_query}」过短，请用更完整的专业名词或题干关键词。"
-                    f"建议：<search>{suggest}</search>"
-                )
-                return (
-                    {"role": "environment", "content": content},
-                    meta,
-                    self.invalid_action_penalty,
-                    False,
-                )
+            # 检索词质量由 Agent 自主负责：过短、占位符或包含选项原文的 query
+            # 均不再由环境提示/拦截，直接交给检索器执行。System Prompt 仍保留软约束。
 
-            if _is_placeholder_search(search_query):
-                content = (
-                    f"[检索结果]\n"
-                    f"检索词「{search_query}」是说明文字而非真实关键词，请从题目提取专业名词。"
-                    f"例如：<search>{suggest}</search>"
-                )
-                return (
-                    {"role": "environment", "content": content},
-                    meta,
-                    self.invalid_action_penalty,
-                    False,
-                )
-
-            biased_opt = _search_biased_by_options(search_query, query)
-            if biased_opt:
-                content = (
-                    f"[检索结果]\n"
-                    f"检索词包含选项名称「{biased_opt}」，请改用中性关键词（如题目主题），"
-                    f"不要把选项原文写进 search。"
-                    f"建议：<search>{suggest}</search>"
-                )
-                return (
-                    {"role": "environment", "content": content},
-                    meta,
-                    self.invalid_action_penalty,
-                    False,
-                )
-
-            results, effective_query = _run_doc_search(
-                self.docs_dir,
+            next_search_count = search_count + 1
+            allow_fallback = _fallback_eligible(
+                enabled=self.auto_fallback_search,
+                has_prior_search_hit=has_search_hit,
+                search_count_after_current=next_search_count,
+                fallback_after_failed_searches=self.fallback_after_failed_searches,
+            )
+            results, effective_query, used_fallback = _run_doc_search(
+                self.doc_index,
                 search_query,
                 top_k=self.search_top_k,
                 snippet_chars=self.snippet_chars,
                 split_long_search=self.split_long_search,
                 split_max_len=self.split_max_len,
-                auto_fallback=self.auto_fallback_search,
+                allow_fallback=allow_fallback,
                 fallback_query=suggest,
             )
             content = format_search_results(
                 search_query,
                 results,
-                suggest=suggest,
                 used_query=effective_query,
+                used_fallback=used_fallback,
+                fallback_counts_as_hit=self.fallback_counts_as_hit,
+                searches_remaining=max(0, self.max_searches - next_search_count),
+            )
+            credited_hit = _credited_search_hit(
+                results_found=bool(results),
+                used_fallback=used_fallback,
+                fallback_counts_as_hit=self.fallback_counts_as_hit,
             )
             new_meta: QAAgentMetadata = {
                 **meta,
-                "search_count": search_count + 1,
+                "search_count": next_search_count,
                 "last_search_query": search_query,
-                "has_search_hit": has_search_hit or bool(results),
+                "has_search_hit": has_search_hit or credited_hit,
+                "fallback_count": int(meta.get("fallback_count", 0))
+                + int(used_fallback),
             }
-            return {"role": "environment", "content": content}, new_meta, 0.0, False
+            search_reward = self.fallback_penalty if used_fallback else 0.0
+            return (
+                {"role": "environment", "content": content},
+                new_meta,
+                search_reward,
+                False,
+            )
 
         if search_count > 0:
-            content = "请根据已有 [检索结果] 分析，并输出最终 \\boxed{答案}。"
+            content = (
+                "请自行判断已有 [检索结果] 是否充分：若不充分且仍有额度，"
+                "输出新的 <search>关键词</search>；若充分，输出最终 \\boxed{答案}。"
+            )
         else:
             content = (
                 "请先从题目提取专业名词检索，例如 "
@@ -616,6 +537,7 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
             meta.setdefault("search_count", 0)
             meta.setdefault("last_search_query", "")
             meta.setdefault("has_search_hit", False)
+            meta.setdefault("fallback_count", 0)
             obs, new_meta, reward, terminated = self._step_one(log, meta)
             observations.append(obs)
             next_metadata.append(new_meta)
@@ -623,11 +545,12 @@ class QAAgentEnv(EnvironmentInterface[QAAgentMetadata]):
             terminateds.append(terminated)
             expected_answers.append(str(meta.get("expected_answer", "")))
 
-        n = len(message_log_batch)
         return EnvironmentReturn(
             observations=observations,
             metadata=next_metadata,
-            next_stop_strings=[None] * n,
+            # NeMo-RL 会用该字段覆盖下一轮 stop_strings；None 表示取消而非沿用。
+            # 因此所有仍在继续的 episode 都必须显式保留 </search>。
+            next_stop_strings=_next_action_stop_strings(terminateds),
             rewards=torch.tensor(rewards, dtype=torch.float32),
             terminateds=torch.tensor(terminateds, dtype=torch.bool),
             answers=expected_answers,

@@ -24,11 +24,11 @@ grpo:
   num_prompts_per_step: 4
   num_generations_per_prompt: 8
   max_rollout_turns: 6
-  max_num_steps: 500
-  val_period: 50
+  max_num_steps: 200
+  val_period: 25
   val_at_start: true
   val_at_end: true
-  max_val_samples: 128
+  max_val_samples: 256
   val_batch_size: 64
 
 loss_fn:
@@ -48,18 +48,29 @@ env:
     cfg:
       docs_dir: /data/docs
       max_searches: 3
-      search_top_k: 5
-      snippet_chars: 600
-      min_search_len: 4
-      require_search_before_answer: true
+      # Actor 启动时一次建段落级 BM25 索引；每次 search 不再扫描/重读全部文件。
+      search_top_k: 3
+      snippet_chars: 400
+      search_chunk_chars: 800
+      search_chunk_overlap: 120
+      search_per_file_limit: 2
+      search_max_files: 5000
+      search_max_chunks: 50000
+      # 多词 query 至少共同命中 2 个 token，并满足 token 或原始词覆盖率，过滤单高频词噪声。
+      search_min_query_coverage: 0.35
+      search_min_matched_tokens: 2
+      search_min_raw_term_coverage: 0.5
+      # 环境不强制是否搜索/是否命中；Agent 自主决定，至少一次搜索仅由 system prompt 软约束。
       auto_fallback_search: true
-      split_long_search: true
+      # 仅当三次自主搜索全部无结果时，环境额外执行一次题干 fallback（不占自主额度）。
+      fallback_after_failed_searches: 3
+      fallback_penalty: -0.05
+      fallback_counts_as_hit: false
+      # BM25 直接综合整条 query；不再把长 query 拆开后按子查询顺序拼结果。
+      split_long_search: false
       split_max_len: 30
-      require_search_hit_before_answer: true
-      no_search_before_answer_penalty: -0.1
       use_judge: true
       invalid_action_penalty: -0.1
-      truncation_penalty: 0.0
 
 logger:
   wandb_enabled: false

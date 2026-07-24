@@ -19,6 +19,7 @@ REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+import nemo_rl.algorithms.grpo as grpo_module
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -37,7 +38,28 @@ TASK_NAME = "qa_agent"
 # 每轮生成在 </search> 处截断，便于环境回灌检索结果后继续多轮。
 STOP_STRINGS = ["</search>"]
 
-DEFAULT_AGENT_SYSTEM_PROMPT = r"""
+
+def _install_fixed_refit_buffer() -> None:
+    """Avoid the unsupported NVML free-memory query on the lab GB10."""
+    original_refit = grpo_module.refit_policy_generation
+    buffer_size_gb = int(os.environ.get("NRL_REFIT_BUFFER_SIZE_GB", "4"))
+
+    def refit_with_fixed_buffer(
+        policy, policy_generation, colocated_inference, *args, **kwargs
+    ):
+        if colocated_inference and kwargs.get("_refit_buffer_size_gb") is None:
+            kwargs["_refit_buffer_size_gb"] = buffer_size_gb
+        return original_refit(
+            policy,
+            policy_generation,
+            colocated_inference,
+            *args,
+            **kwargs,
+        )
+
+    grpo_module.refit_policy_generation = refit_with_fixed_buffer
+
+LONG_AGENT_SYSTEM_PROMPT = r"""
 你是技术培训考题检索 Agent。目标是用尽可能少而有效的检索找到可靠依据，并按题目要求准确作答。
 
 【可用动作】
@@ -81,6 +103,17 @@ DEFAULT_AGENT_SYSTEM_PROMPT = r"""
    - 禁止伪造、改写或自行输出“[检索结果]”；禁止在没有最终 boxed 的情况下结束。
 """.strip()
 
+DEFAULT_AGENT_SYSTEM_PROMPT = r"""
+你是技术培训考题检索 Agent，用尽量少的有效检索寻找可靠依据并准确作答。
+可用工具每轮只能二选一：<search>检索词</search> 或 \boxed{答案}；禁止同轮混用。
+
+规则：
+1. 每题先检索至少一次。识别所问对象与属性/关系，用 4~30 字的“核心概念 + 所问属性”检索，保留必要的中英文术语；不要照抄整题、使用空泛词或仅用某个选项诱导检索。
+2. 对 [检索结果] 判断相关性、充分性、一致性和信息缺口。证据充分则立即作答；不足且有额度时围绕缺口换更具体的词或角度。结果过宽就收窄，结果为零就换同义词、完整术语或中英文名称；禁止重复查询或为耗尽额度而搜索。
+3. 若环境在连续无结果后执行题干 fallback，收到后不得继续检索，应判断证据并完成作答。
+4. 严格遵守题目要求的答案格式，最终只输出一次 \boxed{答案}：单选/判断填一个字母；多选列出所需字母；填空按空位顺序；简答覆盖关键要点。优先依据真实结果；无证据时可给出最稳妥答案，但不得假称有检索依据。
+5. 禁止伪造、改写或自行输出 [检索结果]，也不得无 boxed 结束。
+""".strip()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="题库多轮 Agent GRPO 训练")
@@ -159,6 +192,7 @@ class QAAgentJsonlDataset(Dataset):
 
 def main():
     register_omegaconf_resolvers()
+    _install_fixed_refit_buffer()
     args, overrides = parse_args()
     if not args.config:
         args.config = os.path.join(THIS_DIR, "config.yaml")
@@ -220,7 +254,6 @@ def main():
     (
         policy,
         policy_generation,
-        _nemo_gym,
         cluster,
         dataloader,
         val_dataloader,
